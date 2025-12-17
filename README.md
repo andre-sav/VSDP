@@ -1,10 +1,4 @@
-# VanillaSoft Streamlit App (Superior UI + Hardcoded Template Schema)
-
-This package keeps the "wizard-style" UI from your latest `app.py` while implementing the updated schema logic:
-
-- Output columns match the selected data source template **exactly** (order preserved)
-- The **only** additional output column is `Import Notes`
-  - Filled with a Zoho CRM URL only when a Locatings match is found (otherwise blank)
+# VanillaSoft Data Preperation Streamlit App
 
 ## Run locally
 ```bash
