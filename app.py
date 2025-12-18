@@ -390,12 +390,28 @@ def clean_phone_dataframe(df: pd.DataFrame, phone_column: str) -> Tuple[pd.DataF
 
 
 def remove_duplicate_phones(df: pd.DataFrame, phone_column: str) -> Tuple[pd.DataFrame, int]:
-    """Remove duplicate phone numbers, keeping only the first occurrence."""
+    """Remove duplicate phone numbers, keeping only the first occurrence.
+    
+    Records with empty/null phone numbers are NOT treated as duplicates
+    and are all kept.
+    """
     if phone_column not in df.columns:
         return df, 0
     
     initial_count = len(df)
-    df_clean = df.drop_duplicates(subset=[phone_column], keep='first')
+    
+    # Separate records with and without phone numbers
+    has_phone = df[phone_column].notna() & (df[phone_column].astype(str).str.strip() != '')
+    
+    df_with_phone = df[has_phone].copy()
+    df_without_phone = df[~has_phone].copy()
+    
+    # Only dedupe records that have phone numbers
+    df_with_phone_deduped = df_with_phone.drop_duplicates(subset=[phone_column], keep='first')
+    
+    # Combine: deduped records with phones + all records without phones
+    df_clean = pd.concat([df_with_phone_deduped, df_without_phone], ignore_index=True)
+    
     duplicates_removed = initial_count - len(df_clean)
     
     return df_clean, duplicates_removed
