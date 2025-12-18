@@ -35,7 +35,7 @@ CALL_CENTER_AGENTS: List[str] = [
     "caroline@hlmii.com", 
     "dodie@hlmii.com", 
     "chelsie@hlmii.com",
-    "hannah@hlmii.,com", 
+    "hannah@hlmii.com", 
     "jessica@hlmii.com"
 ]
 
