@@ -30,9 +30,13 @@ import streamlit as st
 # Replace with actual agent emails
 
 CALL_CENTER_AGENTS: List[str] = [
-    "agent1@company.com",
-    "agent2@company.com", 
-    "agent3@company.com",
+    "courtney@hlmii.com", 
+    "caitlyn@hlmii.com", 
+    "caroline@hlmii.com", 
+    "dodie@hlmii.com", 
+    "chelsie@hlmii.com",
+    "hannah@hlmii.,com", 
+    "jessica@hlmii.com"
 ]
 
 
@@ -291,33 +295,52 @@ class ZohoAPI:
         
         return results
 
-    def batch_query_deliveries(self, cities: List[str]) -> Dict[str, List[Dict]]:
-        """Query multiple cities in one API call using IN operator."""
-        if not cities or not self.access_token:
+    def batch_query_deliveries(self, cities: List[str], zip_codes: List[str] = None) -> Dict[str, List[Dict]]:
+        """
+        Query Deliveries module. The City field contains full location string like
+        "Long Beach, CA 90803" so we need to use LIKE for partial matching.
+        
+        Since LIKE doesn't work well with batch IN queries, we query individually
+        but cache results to avoid duplicate queries.
+        """
+        if not self.access_token:
             return {}
         
         results = {}
-        batch_size = 50
+        queried_terms = set()
         
-        for i in range(0, len(cities), batch_size):
-            batch = cities[i:i + batch_size]
-            in_values = ", ".join([f"'{str(c).replace(chr(39), chr(39)+chr(39))}'" for c in batch])
+        # Combine cities and zip codes for querying
+        search_terms = []
+        if cities:
+            search_terms.extend([(c, 'city') for c in cities if c])
+        if zip_codes:
+            search_terms.extend([(z, 'zip') for z in zip_codes if z])
+        
+        for term, term_type in search_terms:
+            if term in queried_terms:
+                continue
+            queried_terms.add(term)
             
+            # Escape single quotes in search term
+            escaped_term = str(term).replace("'", "''")
+            
+            # Use LIKE to search within the City field (which contains "City, State ZIP")
             query = f"""
                 select id, {self.config.deliveries_address_field}, {self.config.deliveries_city_field}
                 from Deliveries
-                where {self.config.deliveries_city_field} in ({in_values})
-                limit 2000
+                where {self.config.deliveries_city_field} like '%{escaped_term}%'
+                limit 200
             """.strip()
             
             response = self.execute_coql(query)
             
             for record in response.get("data", []):
-                city = str(record.get(self.config.deliveries_city_field, ""))
-                if city:
-                    if city not in results:
-                        results[city] = []
-                    results[city].append(record)
+                city_field = str(record.get(self.config.deliveries_city_field, ""))
+                if city_field:
+                    # Store under the original search term
+                    if term not in results:
+                        results[term] = []
+                    results[term].append(record)
         
         return results
     
@@ -516,7 +539,8 @@ def match_with_zoho(df: pd.DataFrame, zoho_api: ZohoAPI, progress_callback=None)
     if progress_callback:
         progress_callback(0.3, "Querying Zoho CRM Deliveries...")
     
-    deliveries_by_city = zoho_api.batch_query_deliveries(cities)
+    # Query Deliveries by both city and ZIP (since City field contains "City, State ZIP")
+    deliveries_by_term = zoho_api.batch_query_deliveries(cities, zip_codes)
     
     if progress_callback:
         progress_callback(0.5, "Querying Zoho CRM Locatings...")
@@ -537,16 +561,30 @@ def match_with_zoho(df: pd.DataFrame, zoho_api: ZohoAPI, progress_callback=None)
         if not address or (not zip_code and not city):
             continue
         
-        if city and city in deliveries_by_city:
-            match = match_address(
+        # Check Deliveries first - try matching by city OR zip code
+        delivery_match = None
+        
+        # Try city match
+        if city and city in deliveries_by_term:
+            delivery_match = match_address(
                 address, 
-                deliveries_by_city[city], 
+                deliveries_by_term[city], 
                 zoho_api.config.deliveries_address_field
             )
-            if match:
-                found_in_deliveries.append(idx)
-                continue
         
+        # If no city match, try ZIP match
+        if not delivery_match and zip_code and zip_code in deliveries_by_term:
+            delivery_match = match_address(
+                address, 
+                deliveries_by_term[zip_code], 
+                zoho_api.config.deliveries_address_field
+            )
+        
+        if delivery_match:
+            found_in_deliveries.append(idx)
+            continue
+        
+        # Check Locatings
         if zip_code and zip_code in locatings_by_zip:
             match = match_address(
                 address, 
