@@ -6,7 +6,7 @@ A user-friendly web interface for preparing ZoomInfo/SalesGenie data
 for VanillaSoft upload with Zoho CRM matching.
 
 Usage:
-    streamlit run vanillasoft_streamlit_app.py
+    streamlit run app.py
 
 Requirements:
     pip install streamlit pandas requests python-dotenv openpyxl
@@ -24,10 +24,45 @@ import streamlit as st
 
 
 # =============================================================================
+# CALL CENTER AGENTS (Round-Robin Assignment)
+# =============================================================================
+# These emails will be assigned to records in round-robin fashion
+# Replace with actual agent emails
+
+CALL_CENTER_AGENTS: List[str] = [
+    "agent1@company.com",
+    "agent2@company.com", 
+    "agent3@company.com",
+]
+
+
+def assign_contact_owners(df: pd.DataFrame, agents: List[str]) -> pd.DataFrame:
+    """
+    Assign contact owners to records in round-robin fashion.
+    
+    Args:
+        df: DataFrame to assign contact owners to
+        agents: List of agent email addresses
+    
+    Returns:
+        DataFrame with 'Contact Owner' column populated
+    """
+    df = df.copy()
+    
+    if not agents:
+        df['Contact Owner'] = ''
+        return df
+    
+    # Round-robin assignment
+    num_agents = len(agents)
+    df['Contact Owner'] = [agents[i % num_agents] for i in range(len(df))]
+    
+    return df
+
+
+# =============================================================================
 # OUTPUT SCHEMA (HARDCODED FROM OFFICIAL TEMPLATES)
 # =============================================================================
-# Output CSV must match the selected data source template's columns (order preserved),
-# plus ONE additional column: "Import Notes" (Zoho Locatings URL if match found; otherwise blank).
 
 SALES_GENIE_TEMPLATE_COLUMNS = ['List Source', 'Company Name', 'Business', 'Number of Employees', 'Web site', 'First Name', 'Last Name', 'Title', 'Address', 'City', 'State', 'ZIP code', 'Primary SIC', 'Primary Line of Business', 'Square Footage', 'Contact Owner', 'Lead Source', 'Vending Business Name', 'Operator Name', 'Operator Phone #', 'Operator Email Address', 'Operator Zip Code', 'Operator Website Address', 'Best Appts Time', 'Unavailable for appointments', 'Team', 'Call Priority']
 ZOOMINFO_TEMPLATE_COLUMNS = ['List Source', 'Last Name', 'First Name', 'Title', 'Home', 'Email', 'Mobile', 'Company', 'Web site', 'Business', 'Number of Employees', 'Primary SIC', 'Primary Line of Business', 'Address', 'City', 'State', 'ZIP code', 'Square Footage', 'Contact Owner', 'Lead Source', 'Vending Business Name', 'Operator Name', 'Operator Phone #', 'Operator Email Address', 'Operator Zip Code', 'Operator Website Address', 'Best Appts Time', 'Unavailable for appointments', 'Team', 'Call Priority']
@@ -43,17 +78,14 @@ def enforce_output_schema(df: pd.DataFrame, data_source: str) -> pd.DataFrame:
     desired = list(get_template_columns(data_source)) + [EXTRA_OUTPUT_COLUMN]
     df = df.copy()
 
-    # ensure desired columns exist
     for c in desired:
         if c not in df.columns:
             df[c] = ""
 
-    # drop extras + reorder
     return df[desired].copy()
 
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 # =============================================================================
@@ -67,7 +99,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for better styling
 st.markdown("""
 <style>
     .main-header {
@@ -116,11 +147,6 @@ class Config:
     """Configuration class for Zoho CRM settings"""
     
     def __init__(self):
-        # Template paths (stored in assets folder)
-        self.assets_folder = "assets"
-        self.zoominfo_template_path = os.path.join(self.assets_folder, "ZoomInfo_Default_List.csv")
-        self.salesgenie_template_path = os.path.join(self.assets_folder, "Sales_Genie_Default_List.csv")
-        
         # Zoho CRM API Configuration (from environment)
         self.zoho_accounts_url = os.getenv("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.com").rstrip("/")
         self.zoho_api_base = os.getenv("ZOHO_API_BASE", "https://www.zohoapis.com/crm/v8").rstrip("/")
@@ -140,13 +166,6 @@ class Config:
             self.zoho_client_secret and 
             self.zoho_refresh_token
         )
-    
-    def get_template_path(self, data_source: str) -> str:
-        """Get the template path for the given data source."""
-        if data_source == "ZoomInfo":
-            return self.zoominfo_template_path
-        else:
-            return self.salesgenie_template_path
 
 
 # =============================================================================
@@ -359,40 +378,209 @@ def remove_duplicate_phones(df: pd.DataFrame, phone_column: str) -> Tuple[pd.Dat
     return df_clean, duplicates_removed
 
 
-def load_master_data(master_file) -> Dict[str, str]:
-    """Load operator metadata from Master Data Excel file."""
+def load_master_data_multi(master_file, num_columns: int = 5) -> List[Dict[str, str]]:
+    """
+    Load operator metadata from the last N columns of Master Data Excel file.
+    
+    Data is read from FIXED ROW POSITIONS:
+    - Row 2: Vending Business Name (may be empty)
+    - Row 3: Operator Name
+    - Row 4: Phone
+    - Row 5: Email
+    - Row 6: ZIP Code
+    - Row 7: Website
+    - Row 10: Team
+    
+    Args:
+        master_file: Uploaded Excel file
+        num_columns: Number of columns to read from the right (default: 5)
+    
+    Returns:
+        List of operator info dictionaries
+    """
     master_df = pd.read_excel(master_file)
     
-    last_column = master_df.iloc[:, -1]
-    non_null_values = last_column[last_column.notna()].tolist()
+    total_cols = master_df.shape[1]
+    start_col = max(0, total_cols - num_columns)
     
-    if len(non_null_values) >= 6:
+    operators = []
+    
+    # Fixed row positions for operator data
+    ROW_BUSINESS_NAME = 2
+    ROW_OPERATOR_NAME = 3
+    ROW_PHONE = 4
+    ROW_EMAIL = 5
+    ROW_ZIP = 6
+    ROW_WEBSITE = 7
+    ROW_TEAM = 10
+    
+    def safe_get(df, row, col):
+        """Safely get a cell value, returning 'N/A' if empty, NaN, or already 'N/A'."""
+        try:
+            if row < len(df):
+                val = df.iloc[row, col]
+                if pd.notna(val):
+                    # Clean up non-breaking spaces and whitespace
+                    cleaned = str(val).replace('\xa0', ' ').strip()
+                    # Return N/A if empty or already N/A
+                    if cleaned == '' or cleaned.upper() == 'N/A':
+                        return 'N/A'
+                    return cleaned
+        except (IndexError, KeyError):
+            pass
+        return 'N/A'
+    
+    for col_idx in range(start_col, total_cols):
+        # Read from fixed row positions
+        operator_name = safe_get(master_df, ROW_OPERATOR_NAME, col_idx)
+        
+        # Skip columns that don't have a valid operator name
+        if operator_name == 'N/A':
+            continue
+        
         operator_info = {
-            'vending_business_name': str(non_null_values[0]),
-            'operator_name': str(non_null_values[1]),
-            'operator_phone': str(non_null_values[2]),
-            'operator_email': str(non_null_values[3]),
-            'operator_zip': str(non_null_values[4]),
-            'operator_website': str(non_null_values[5]),
-            'team': str(non_null_values[6]) if len(non_null_values) > 6 else ''
+            'column_index': col_idx,
+            'vending_business_name': safe_get(master_df, ROW_BUSINESS_NAME, col_idx),
+            'operator_name': operator_name,
+            'operator_phone': safe_get(master_df, ROW_PHONE, col_idx),
+            'operator_email': safe_get(master_df, ROW_EMAIL, col_idx),
+            'operator_zip': safe_get(master_df, ROW_ZIP, col_idx),
+            'operator_website': safe_get(master_df, ROW_WEBSITE, col_idx),
+            'team': safe_get(master_df, ROW_TEAM, col_idx)
         }
+        operators.append(operator_info)
+    
+    return operators
+
+
+def fill_operator_fields(df: pd.DataFrame, operator_info: Dict[str, str], 
+                        data_source: str) -> pd.DataFrame:
+    """Fill operator-related fields and metadata in the dataframe."""
+    df = df.copy()
+    
+    df['Vending Business Name'] = operator_info.get('vending_business_name', '')
+    df['Operator Name'] = operator_info.get('operator_name', '')
+    df['Operator Phone #'] = operator_info.get('operator_phone', '')
+    df['Operator Email Address'] = operator_info.get('operator_email', '')
+    df['Operator Zip Code'] = operator_info.get('operator_zip', '')
+    df['Operator Website Address'] = operator_info.get('operator_website', '')
+    
+    if 'Team' in df.columns and operator_info.get('team'):
+        df['Team'] = operator_info['team']
+    
+    today = datetime.now().strftime('%b %d %Y')
+    df['List Source'] = f"{data_source} {today}"
+    
+    return df
+
+
+def match_address(search_address: str, records: List[Dict], address_field: str) -> Optional[Dict]:
+    """Find matching address in a list of records."""
+    if not search_address or not records:
+        return None
+    
+    search_addr = str(search_address).lower().strip()
+    
+    for record in records:
+        record_addr = str(record.get(address_field, "")).lower().strip()
+        
+        if search_addr == record_addr:
+            return record
+        if search_addr in record_addr or record_addr in search_addr:
+            return record
+    
+    return None
+
+
+def match_with_zoho(df: pd.DataFrame, zoho_api: ZohoAPI, progress_callback=None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    """Match records with Zoho CRM using batch queries."""
+    stats = {
+        'deliveries_found': 0,
+        'locatings_found': 0,
+        'not_found': 0,
+        'zoho_enabled': zoho_api.config.zoho_enabled
+    }
+    
+    if not zoho_api.config.zoho_enabled:
+        return df, pd.DataFrame(), stats
+    
+    if not zoho_api.mint_access_token():
+        stats['zoho_enabled'] = False
+        return df, pd.DataFrame(), stats
+    
+    df = df.copy()
+    
+    zip_codes = df['ZIP code'].dropna().astype(str).unique().tolist()
+    cities = df['City'].dropna().astype(str).unique().tolist()
+    
+    if progress_callback:
+        progress_callback(0.3, "Querying Zoho CRM Deliveries...")
+    
+    deliveries_by_city = zoho_api.batch_query_deliveries(cities)
+    
+    if progress_callback:
+        progress_callback(0.5, "Querying Zoho CRM Locatings...")
+    
+    locatings_by_zip = zoho_api.batch_query_locatings(zip_codes)
+    
+    if progress_callback:
+        progress_callback(0.7, "Matching records...")
+    
+    found_in_deliveries = []
+    found_in_locatings = []
+    
+    for idx, row in df.iterrows():
+        address = str(row.get('Address', ''))
+        zip_code = str(row.get('ZIP code', ''))
+        city = str(row.get('City', ''))
+        
+        if not address or (not zip_code and not city):
+            continue
+        
+        if city and city in deliveries_by_city:
+            match = match_address(
+                address, 
+                deliveries_by_city[city], 
+                zoho_api.config.deliveries_address_field
+            )
+            if match:
+                found_in_deliveries.append(idx)
+                continue
+        
+        if zip_code and zip_code in locatings_by_zip:
+            match = match_address(
+                address, 
+                locatings_by_zip[zip_code], 
+                zoho_api.config.locatings_address_field
+            )
+            if match:
+                record_id = match.get('id')
+                url = zoho_api.build_record_url('Locatings', record_id)
+                found_in_locatings.append((idx, url))
+    
+    stats['deliveries_found'] = len(found_in_deliveries)
+    stats['locatings_found'] = len(found_in_locatings)
+    stats['not_found'] = len(df) - len(found_in_deliveries) - len(found_in_locatings)
+    
+    if found_in_deliveries:
+        df_deliveries = df.loc[found_in_deliveries].copy()
+        df = df.drop(found_in_deliveries)
     else:
-        operator_info = {
-            'vending_business_name': '',
-            'operator_name': '',
-            'operator_phone': '',
-            'operator_email': '',
-            'operator_zip': '',
-            'operator_website': '',
-            'team': ''
-        }
+        df_deliveries = pd.DataFrame()
     
-    return operator_info
+    if found_in_locatings:
+        if 'Import Notes' not in df.columns:
+            df['Import Notes'] = ''
+        for idx, url in found_in_locatings:
+            if idx in df.index:
+                df.at[idx, 'Import Notes'] = url
+    
+    return df, df_deliveries, stats
 
 
-def load_template(filepath: str) -> pd.DataFrame:
-    """Load the template CSV file from the given path."""
-    return pd.read_csv(filepath)
+def convert_df_to_csv(df: pd.DataFrame) -> bytes:
+    """Convert dataframe to CSV bytes for download."""
+    return df.to_csv(index=False).encode('utf-8')
 
 
 def map_zoominfo_to_template(df_raw: pd.DataFrame, template_df: pd.DataFrame) -> pd.DataFrame:
@@ -453,154 +641,20 @@ def map_salesgenie_to_template(df_raw: pd.DataFrame, template_df: pd.DataFrame) 
     return df_output
 
 
-def fill_operator_fields(df: pd.DataFrame, operator_info: Dict[str, str], 
-                        contact_owner: str, data_source: str) -> pd.DataFrame:
-    """Fill operator-related fields and metadata in the dataframe."""
-    df = df.copy()
-    
-    df['Vending Business Name'] = operator_info.get('vending_business_name', '')
-    df['Operator Name'] = operator_info.get('operator_name', '')
-    df['Operator Phone #'] = operator_info.get('operator_phone', '')
-    df['Operator Email Address'] = operator_info.get('operator_email', '')
-    df['Operator Zip Code'] = operator_info.get('operator_zip', '')
-    df['Operator Website Address'] = operator_info.get('operator_website', '')
-    
-    if 'Team' in df.columns and operator_info.get('team'):
-        df['Team'] = operator_info['team']
-    
-    df['Contact Owner'] = contact_owner
-    
-    today = datetime.now().strftime('%b %d %Y')
-    df['List Source'] = f"{data_source} {today}"
-    
-    return df
-
-
-def match_address(search_address: str, records: List[Dict], address_field: str) -> Optional[Dict]:
-    """Find matching address in a list of records."""
-    if not search_address or not records:
-        return None
-    
-    search_addr = str(search_address).lower().strip()
-    
-    for record in records:
-        record_addr = str(record.get(address_field, "")).lower().strip()
-        
-        if search_addr == record_addr:
-            return record
-        if search_addr in record_addr or record_addr in search_addr:
-            return record
-    
-    return None
-
-
-def match_with_zoho(df: pd.DataFrame, zoho_api: ZohoAPI, progress_callback=None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
-    """Match records with Zoho CRM using batch queries."""
-    stats = {
-        'deliveries_found': 0,
-        'locatings_found': 0,
-        'not_found': 0,
-        'zoho_enabled': zoho_api.config.zoho_enabled
-    }
-    
-    if not zoho_api.config.zoho_enabled:
-        return df, pd.DataFrame(), stats
-    
-    if not zoho_api.mint_access_token():
-        stats['zoho_enabled'] = False
-        return df, pd.DataFrame(), stats
-    
-    df = df.copy()
-    
-    # Collect unique ZIP codes and cities
-    zip_codes = df['ZIP code'].dropna().astype(str).unique().tolist()
-    cities = df['City'].dropna().astype(str).unique().tolist()
-    
-    if progress_callback:
-        progress_callback(0.3, "Querying Zoho CRM Deliveries...")
-    
-    deliveries_by_city = zoho_api.batch_query_deliveries(cities)
-    
-    if progress_callback:
-        progress_callback(0.5, "Querying Zoho CRM Locatings...")
-    
-    locatings_by_zip = zoho_api.batch_query_locatings(zip_codes)
-    
-    if progress_callback:
-        progress_callback(0.7, "Matching records...")
-    
-    found_in_deliveries = []
-    found_in_locatings = []
-    
-    for idx, row in df.iterrows():
-        address = str(row.get('Address', ''))
-        zip_code = str(row.get('ZIP code', ''))
-        city = str(row.get('City', ''))
-        
-        if not address or (not zip_code and not city):
-            continue
-        
-        # Check Deliveries first
-        if city and city in deliveries_by_city:
-            match = match_address(
-                address, 
-                deliveries_by_city[city], 
-                zoho_api.config.deliveries_address_field
-            )
-            if match:
-                found_in_deliveries.append(idx)
-                continue
-        
-        # Check Locatings
-        if zip_code and zip_code in locatings_by_zip:
-            match = match_address(
-                address, 
-                locatings_by_zip[zip_code], 
-                zoho_api.config.locatings_address_field
-            )
-            if match:
-                record_id = match.get('id')
-                url = zoho_api.build_record_url('Locatings', record_id)
-                found_in_locatings.append((idx, url))
-    
-    # Update stats
-    stats['deliveries_found'] = len(found_in_deliveries)
-    stats['locatings_found'] = len(found_in_locatings)
-    stats['not_found'] = len(df) - len(found_in_deliveries) - len(found_in_locatings)
-    
-    # Separate deliveries records
-    if found_in_deliveries:
-        df_deliveries = df.loc[found_in_deliveries].copy()
-        df = df.drop(found_in_deliveries)
-    else:
-        df_deliveries = pd.DataFrame()
-    
-    # Add Import Notes for Locatings matches
-    if found_in_locatings:
-        if 'Import Notes' not in df.columns:
-            df['Import Notes'] = ''
-        for idx, url in found_in_locatings:
-            if idx in df.index:
-                df.at[idx, 'Import Notes'] = url
-    
-    return df, df_deliveries, stats
-
-
-def convert_df_to_csv(df: pd.DataFrame) -> bytes:
-    """Convert dataframe to CSV bytes for download."""
-    return df.to_csv(index=False).encode('utf-8')
-
-
 # =============================================================================
 # STREAMLIT APP
 # =============================================================================
 
 def main():
-    # Initialize session state for results
+    # Initialize session state
     if 'processing_complete' not in st.session_state:
         st.session_state.processing_complete = False
     if 'results' not in st.session_state:
         st.session_state.results = None
+    if 'operators_loaded' not in st.session_state:
+        st.session_state.operators_loaded = []
+    if 'selected_operator' not in st.session_state:
+        st.session_state.selected_operator = None
     
     # Header
     st.markdown('<p class="main-header">🚀 VanillaSoft Data Preparation</p>', unsafe_allow_html=True)
@@ -615,29 +669,11 @@ def main():
     else:
         st.warning("⚠️ Zoho CRM integration disabled (credentials not configured)")
     
-    st.divider()
-    
-    # ==========================================================================
-    # INPUT SECTION
-    # ==========================================================================
-    
-    st.subheader("📝 Step 1: Enter Details")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        data_source = st.selectbox(
-            "Data Source",
-            options=["SalesGenie", "ZoomInfo"],
-            help="Select the source of your raw data"
-        )
-    
-    with col2:
-        contact_owner_email = st.text_input(
-            "Contact Owner Email",
-            placeholder="name@company.com",
-            help="Email address of the contact owner"
-        )
+    # Show call center agents info
+    with st.expander("👥 Call Center Agents (Contact Owners)", expanded=False):
+        st.caption("Records will be distributed evenly among these agents:")
+        for i, agent in enumerate(CALL_CENTER_AGENTS, 1):
+            st.write(f"{i}. {agent}")
     
     st.divider()
     
@@ -645,15 +681,15 @@ def main():
     # FILE UPLOAD SECTION
     # ==========================================================================
     
-    st.subheader("📁 Step 2: Upload Files")
+    st.subheader("📁 Step 1: Upload Files")
     
     col1, col2 = st.columns(2)
     
     with col1:
         raw_file = st.file_uploader(
-            f"Raw {data_source} Data (CSV)",
+            "Raw Data (CSV)",
             type=['csv'],
-            help=f"Upload your raw {data_source} CSV export"
+            help="Upload your raw ZoomInfo or SalesGenie CSV export"
         )
     
     with col2:
@@ -663,36 +699,146 @@ def main():
             help="Upload the Master Data Excel file with operator info"
         )
     
+    # ==========================================================================
+    # AUTO-DETECT DATA SOURCE
+    # ==========================================================================
+    
+    data_source = None
+    
+    if raw_file is not None:
+        # Read just the header to detect source
+        raw_file.seek(0)  # Reset file pointer
+        df_header = pd.read_csv(raw_file, nrows=0)
+        raw_file.seek(0)  # Reset again for later use
+        
+        # Check for ZoomInfo-specific column
+        if "Job Title Hierarchy Level" in df_header.columns:
+            data_source = "ZoomInfo"
+        else:
+            data_source = "SalesGenie"
+        
+        st.success(f"✅ Detected data source: **{data_source}**")
+    
+    # ==========================================================================
+    # OPERATOR SELECTION (After Master Data Upload)
+    # ==========================================================================
+    
+    operator_info = None
+    
+    if master_file is not None:
+        # Load operators from last 5 columns
+        operators = load_master_data_multi(master_file, num_columns=5)
+        st.session_state.operators_loaded = operators
+        
+        if operators:
+            st.divider()
+            st.subheader("👤 Step 2: Select & Edit Operator")
+            
+            # Create display names for dropdown
+            def format_operator_name(op):
+                name = op['operator_name']
+                business = op['vending_business_name']
+                if business and business != 'N/A':
+                    return f"{name} ({business})"
+                return name
+            
+            operator_names = [format_operator_name(op) for op in operators]
+            
+            selected_idx = st.selectbox(
+                "Select Operator",
+                options=range(len(operators)),
+                index=len(operators) - 1,  # Default to last column
+                format_func=lambda x: operator_names[x],
+                help="Choose which operator's information to use"
+            )
+            
+            selected_op = operators[selected_idx]
+            
+            st.caption("📝 Edit operator details below if needed:")
+            
+            # Editable fields in two columns
+            # Include selected_idx in keys so fields reset when operator changes
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                edited_business_name = st.text_input(
+                    "Vending Business Name",
+                    value=selected_op['vending_business_name'],
+                    key=f"edit_business_name_{selected_idx}"
+                )
+                edited_operator_name = st.text_input(
+                    "Operator Name",
+                    value=selected_op['operator_name'],
+                    key=f"edit_operator_name_{selected_idx}"
+                )
+                edited_phone = st.text_input(
+                    "Operator Phone",
+                    value=selected_op['operator_phone'],
+                    key=f"edit_phone_{selected_idx}"
+                )
+                edited_team = st.text_input(
+                    "Team",
+                    value=selected_op.get('team', ''),
+                    key=f"edit_team_{selected_idx}"
+                )
+            
+            with col2:
+                edited_email = st.text_input(
+                    "Operator Email",
+                    value=selected_op['operator_email'],
+                    key=f"edit_email_{selected_idx}"
+                )
+                edited_zip = st.text_input(
+                    "Operator ZIP Code",
+                    value=selected_op['operator_zip'],
+                    key=f"edit_zip_{selected_idx}"
+                )
+                edited_website = st.text_input(
+                    "Operator Website",
+                    value=selected_op['operator_website'],
+                    key=f"edit_website_{selected_idx}"
+                )
+            
+            # Build operator_info from edited values
+            operator_info = {
+                'vending_business_name': edited_business_name,
+                'operator_name': edited_operator_name,
+                'operator_phone': edited_phone,
+                'operator_email': edited_email,
+                'operator_zip': edited_zip,
+                'operator_website': edited_website,
+                'team': edited_team
+            }
+        else:
+            st.warning("⚠️ No valid operator data found in the last 5 columns of the Master Data file.")
+    
     st.divider()
     
     # ==========================================================================
     # VALIDATION
     # ==========================================================================
     
-    # Check if all inputs are provided
     all_inputs_valid = (
-        contact_owner_email and 
-        '@' in contact_owner_email and
         raw_file is not None and 
-        master_file is not None
+        master_file is not None and
+        operator_info is not None and
+        data_source is not None
     )
     
     if not all_inputs_valid:
-        st.info("👆 Please fill in all fields and upload all required files to continue.")
+        st.info("👆 Please upload all required files and select an operator to continue.")
         
-        # Show what's missing
         missing = []
-        if not contact_owner_email or '@' not in contact_owner_email:
-            missing.append("Valid contact owner email")
         if raw_file is None:
-            missing.append(f"Raw {data_source} CSV file")
+            missing.append("Raw CSV file")
         if master_file is None:
             missing.append("Master Data Excel file")
+        if operator_info is None and master_file is not None:
+            missing.append("Valid operator selection")
         
         if missing:
             st.caption("Missing: " + ", ".join(missing))
         
-        # Clear previous results if inputs changed
         st.session_state.processing_complete = False
         st.session_state.results = None
         return
@@ -706,62 +852,50 @@ def main():
     process_button = st.button("▶️ Process Data", type="primary", use_container_width=True)
     
     if process_button:
-        # Clear previous results
         st.session_state.processing_complete = False
         st.session_state.results = None
         
-        # Progress bar
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         try:
-            # Step 1: Load files
             status_text.text("Loading files...")
             progress_bar.progress(0.1)
             
-            # Load master data
-            operator_info = load_master_data(master_file)
-            
-            # Build template schema (hardcoded; no template files needed)
+            # Build template schema
             template_df = build_template_df(data_source)
-
-# Load raw data
+            
+            # Load raw data (reset file pointer since we read it earlier for detection)
+            raw_file.seek(0)
             df_raw = pd.read_csv(raw_file)
             initial_count = len(df_raw)
             
-            # Determine phone column
             phone_column = 'Direct Phone Number' if data_source == 'ZoomInfo' else 'Phone Number Combined'
             
             progress_bar.progress(0.2)
             status_text.text("Cleaning phone numbers...")
             
-            # Step 2: Clean phone numbers
             df_raw, extensions_removed = clean_phone_dataframe(df_raw, phone_column)
-            
-            # Step 3: Remove duplicates
             df_raw, duplicates_removed = remove_duplicate_phones(df_raw, phone_column)
             
             progress_bar.progress(0.3)
             status_text.text("Mapping data to template...")
             
-            # Step 4: Map to template
             if data_source == 'ZoomInfo':
                 df_mapped = map_zoominfo_to_template(df_raw, template_df)
             else:
                 df_mapped = map_salesgenie_to_template(df_raw, template_df)
             
-            # Step 5: Fill operator fields
-            df_mapped = fill_operator_fields(
-                df_mapped, 
-                operator_info, 
-                contact_owner_email, 
-                data_source
-            )
+            # Fill operator fields (without contact owner - that's done separately)
+            df_mapped = fill_operator_fields(df_mapped, operator_info, data_source)
+            
+            # Assign contact owners round-robin
+            status_text.text("Assigning contact owners...")
+            df_mapped = assign_contact_owners(df_mapped, CALL_CENTER_AGENTS)
             
             progress_bar.progress(0.4)
             status_text.text("Matching with Zoho CRM...")
             
-            # Step 6: Match with Zoho CRM
             zoho_api = ZohoAPI(config)
             
             def update_progress(value, text):
@@ -773,21 +907,18 @@ def main():
                 zoho_api, 
                 progress_callback=update_progress
             )
-
-            # Enforce output schema: template columns + 'Import Notes' only
+            
+            # Enforce output schema
             df_final = enforce_output_schema(df_final, data_source)
             if not df_deliveries.empty:
                 df_deliveries = enforce_output_schema(df_deliveries, data_source)
-
             
             progress_bar.progress(1.0)
             status_text.text("✅ Processing complete!")
             
-            # Generate filenames
             clean_operator_name = re.sub(r'[^a-zA-Z0-9_-]', '_', operator_info.get('operator_name', 'Unknown'))
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
-            # Store results in session state
             st.session_state.processing_complete = True
             st.session_state.results = {
                 'df_final': df_final,
@@ -802,7 +933,6 @@ def main():
                 'deliveries_filename': f"{clean_operator_name}_{data_source}_Deliveries_{timestamp}.csv"
             }
             
-            # Show balloons
             st.balloons()
             
         except Exception as e:
@@ -812,7 +942,7 @@ def main():
             st.session_state.results = None
     
     # ==========================================================================
-    # RESULTS SECTION (Always visible when complete)
+    # RESULTS SECTION
     # ==========================================================================
     
     if st.session_state.processing_complete and st.session_state.results:
@@ -820,7 +950,6 @@ def main():
         
         st.divider()
         
-        # Big success banner
         st.markdown("""
         <div style="padding: 1.5rem; background: linear-gradient(135deg, #28a745 0%, #20c997 100%); 
                     border-radius: 10px; text-align: center; margin-bottom: 1rem;">
@@ -829,7 +958,6 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        # Summary metrics in a highlighted box
         st.subheader("📊 Results Summary")
         
         col1, col2, col3, col4 = st.columns(4)
@@ -847,7 +975,10 @@ def main():
             st.metric("Final Records", len(results['df_final']), 
                      delta=f"-{results['initial_count'] - len(results['df_final'])}" if results['initial_count'] > len(results['df_final']) else None)
         
-        # Zoho matching results
+        # Agent distribution summary
+        if 'Contact Owner' in results['df_final'].columns:
+            st.info(f"**👥 Contact Owner Distribution:** Records distributed among {len(CALL_CENTER_AGENTS)} agents (round-robin)")
+        
         if results['zoho_stats']['zoho_enabled']:
             st.info(f"""
             **🔍 Zoho CRM Matching Results:**
@@ -858,13 +989,8 @@ def main():
         
         st.divider()
         
-        # =================================================================
-        # DOWNLOAD SECTION - Prominently displayed
-        # =================================================================
-        
         st.subheader("⬇️ Download Your Files")
         
-        # Main download buttons - large and prominent
         col1, col2 = st.columns(2)
         
         with col1:
@@ -913,8 +1039,7 @@ def main():
         
         st.divider()
         
-        # Operator info - visible by default
-        st.subheader("📋 Operator Information")
+        st.subheader("📋 Operator Information Used")
         col1, col2 = st.columns(2)
         with col1:
             st.write(f"**Business Name:** {results['operator_info'].get('vending_business_name', 'N/A')}")
@@ -925,7 +1050,6 @@ def main():
             st.write(f"**ZIP:** {results['operator_info'].get('operator_zip', 'N/A')}")
             st.write(f"**Website:** {results['operator_info'].get('operator_website', 'N/A')}")
         
-        # Data previews - in tabs for easy access
         st.divider()
         st.subheader("👀 Data Preview")
         
@@ -943,7 +1067,6 @@ def main():
             st.dataframe(results['df_final'].head(20), use_container_width=True)
             st.caption(f"Showing first 20 of {len(results['df_final'])} records")
         
-        # Process another file button
         st.divider()
         if st.button("🔄 Process Another File", use_container_width=True):
             st.session_state.processing_complete = False
