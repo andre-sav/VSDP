@@ -9,10 +9,33 @@ Usage:
     streamlit run app.py
 
 Requirements:
-    pip install streamlit pandas requests python-dotenv openpyxl
+    pip install streamlit pandas requests python-dotenv openpyxl gspread google-auth
+
+Google Sheets Setup (for persistent operator storage):
+    1. Create a Google Cloud project at https://console.cloud.google.com
+    2. Enable the Google Sheets API
+    3. Create a Service Account and download the JSON credentials
+    4. Create a Google Sheet and share it with the service account email
+    5. In Streamlit Cloud, add secrets in the dashboard (Settings > Secrets):
+    
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "your-project-id"
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "your-service-account@your-project.iam.gserviceaccount.com"
+    client_id = "..."
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+    client_x509_cert_url = "..."
+    
+    [google_sheets]
+    spreadsheet_id = "your-spreadsheet-id-from-url"
 """
 
 import io
+import json
 import os
 import re
 from datetime import datetime
@@ -22,6 +45,196 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# Google Sheets integration
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSHEETS_AVAILABLE = True
+except ImportError:
+    GSHEETS_AVAILABLE = False
+
+
+# =============================================================================
+# GOOGLE SHEETS OPERATOR STORAGE
+# =============================================================================
+
+class OperatorStorage:
+    """
+    Persistent storage for operator data using Google Sheets.
+    
+    Setup Instructions:
+    1. Create a Google Cloud project at https://console.cloud.google.com
+    2. Enable the Google Sheets API
+    3. Create a Service Account and download the JSON credentials
+    4. Create a Google Sheet and share it with the service account email
+    5. Add credentials to Streamlit secrets (secrets.toml or Streamlit Cloud)
+    
+    Expected secrets.toml format:
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "your-project-id"
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+    client_email = "your-service-account@your-project.iam.gserviceaccount.com"
+    client_id = "..."
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+    client_x509_cert_url = "..."
+    
+    [google_sheets]
+    spreadsheet_id = "your-spreadsheet-id-from-url"
+    """
+    
+    SCOPES = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # Column headers for the operators sheet
+    HEADERS = [
+        'operator_id',
+        'operator_name', 
+        'vending_business_name',
+        'operator_phone',
+        'operator_email',
+        'operator_zip',
+        'operator_website',
+        'team',
+        'created_at',
+        'updated_at'
+    ]
+    
+    def __init__(self):
+        self.client = None
+        self.sheet = None
+        self.worksheet = None
+        self.is_configured = False
+        self._initialize()
+    
+    def _initialize(self):
+        """Initialize Google Sheets connection."""
+        if not GSHEETS_AVAILABLE:
+            return
+        
+        try:
+            # Check if credentials are configured in Streamlit secrets
+            if 'gcp_service_account' not in st.secrets:
+                return
+            if 'google_sheets' not in st.secrets:
+                return
+            
+            # Create credentials from secrets
+            creds = Credentials.from_service_account_info(
+                dict(st.secrets['gcp_service_account']),
+                scopes=self.SCOPES
+            )
+            
+            # Connect to Google Sheets
+            self.client = gspread.authorize(creds)
+            
+            # Open the spreadsheet
+            spreadsheet_id = st.secrets['google_sheets']['spreadsheet_id']
+            self.sheet = self.client.open_by_key(spreadsheet_id)
+            
+            # Get or create the operators worksheet
+            try:
+                self.worksheet = self.sheet.worksheet('Operators')
+            except gspread.WorksheetNotFound:
+                self.worksheet = self.sheet.add_worksheet(
+                    title='Operators',
+                    rows=100,
+                    cols=len(self.HEADERS)
+                )
+                # Add headers
+                self.worksheet.update('A1', [self.HEADERS])
+            
+            self.is_configured = True
+            
+        except Exception as e:
+            st.warning(f"⚠️ Google Sheets not configured: {str(e)}")
+            self.is_configured = False
+    
+    def get_all_operators(self) -> List[Dict]:
+        """Retrieve all saved operators from Google Sheets."""
+        if not self.is_configured:
+            return []
+        
+        try:
+            # Get all records
+            records = self.worksheet.get_all_records()
+            return records
+        except Exception as e:
+            st.error(f"Error loading operators: {str(e)}")
+            return []
+    
+    def save_operator(self, operator: Dict) -> bool:
+        """Save a new operator or update existing one."""
+        if not self.is_configured:
+            return False
+        
+        try:
+            now = datetime.now().isoformat()
+            
+            # Check if operator already exists (by name)
+            existing = self.get_all_operators()
+            existing_row = None
+            
+            for idx, op in enumerate(existing):
+                if op.get('operator_name') == operator.get('operator_name'):
+                    existing_row = idx + 2  # +2 for header row and 0-indexing
+                    break
+            
+            # Prepare row data
+            row_data = [
+                operator.get('operator_id', f"op_{datetime.now().strftime('%Y%m%d%H%M%S')}"),
+                operator.get('operator_name', ''),
+                operator.get('vending_business_name', 'N/A'),
+                operator.get('operator_phone', 'N/A'),
+                operator.get('operator_email', 'N/A'),
+                operator.get('operator_zip', 'N/A'),
+                operator.get('operator_website', 'N/A'),
+                operator.get('team', 'N/A'),
+                operator.get('created_at', now),
+                now  # updated_at
+            ]
+            
+            if existing_row:
+                # Update existing row
+                self.worksheet.update(f'A{existing_row}', [row_data])
+            else:
+                # Append new row
+                self.worksheet.append_row(row_data)
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"Error saving operator: {str(e)}")
+            return False
+    
+    def delete_operator(self, operator_name: str) -> bool:
+        """Delete an operator by name."""
+        if not self.is_configured:
+            return False
+        
+        try:
+            # Find the operator's row
+            cell = self.worksheet.find(operator_name, in_column=2)
+            if cell:
+                self.worksheet.delete_rows(cell.row)
+                return True
+            return False
+            
+        except Exception as e:
+            st.error(f"Error deleting operator: {str(e)}")
+            return False
+
+
+@st.cache_resource
+def get_operator_storage():
+    """Get cached operator storage instance."""
+    return OperatorStorage()
+
 
 # =============================================================================
 # CALL CENTER AGENTS (Round-Robin Assignment)
@@ -30,13 +243,9 @@ import streamlit as st
 # Replace with actual agent emails
 
 CALL_CENTER_AGENTS: List[str] = [
-    "courtney@hlmii.com", 
-    "caitlyn@hlmii.com", 
-    "caroline@hlmii.com", 
-    "dodie@hlmii.com", 
-    "chelsie@hlmii.com",
-    "hannah@hlmii.com", 
-    "jessica@hlmii.com"
+    "agent1@company.com",
+    "agent2@company.com", 
+    "agent3@company.com",
 ]
 
 
@@ -735,23 +944,13 @@ def main():
     # FILE UPLOAD SECTION
     # ==========================================================================
     
-    st.subheader("📁 Step 1: Upload Files")
+    st.subheader("📁 Step 1: Upload Raw Data")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        raw_file = st.file_uploader(
-            "Raw Data (CSV)",
-            type=['csv'],
-            help="Upload your raw ZoomInfo or SalesGenie CSV export"
-        )
-    
-    with col2:
-        master_file = st.file_uploader(
-            "Master Data (Excel)",
-            type=['xlsx', 'xls'],
-            help="Upload the Master Data Excel file with operator info"
-        )
+    raw_file = st.file_uploader(
+        "Raw Data (CSV)",
+        type=['csv'],
+        help="Upload your raw ZoomInfo or SalesGenie CSV export"
+    )
     
     # ==========================================================================
     # AUTO-DETECT DATA SOURCE
@@ -773,98 +972,457 @@ def main():
         
         st.success(f"✅ Detected data source: **{data_source}**")
     
+    st.divider()
+    
     # ==========================================================================
-    # OPERATOR SELECTION (After Master Data Upload)
+    # OPERATOR DATA ENTRY MODE
     # ==========================================================================
+    
+    st.subheader("👤 Step 2: Operator Information")
+    
+    # Initialize operator storage
+    operator_storage = get_operator_storage()
+    
+    # Build mode options based on what's available
+    mode_options = ["Upload Master Excel File", "Manual Entry", "Load from File"]
+    if operator_storage.is_configured:
+        mode_options.insert(0, "☁️ Saved Operators")  # Cloud option first if available
+    
+    operator_mode = st.radio(
+        "How would you like to provide operator data?",
+        options=mode_options,
+        horizontal=True,
+        help="Choose how to input operator information"
+    )
     
     operator_info = None
     
-    if master_file is not None:
-        # Load operators from last 5 columns
-        operators = load_master_data_multi(master_file, num_columns=5)
-        st.session_state.operators_loaded = operators
+    # ---------------------------------------------------------------------
+    # MODE: Saved Operators (Google Sheets Cloud Storage)
+    # ---------------------------------------------------------------------
+    if operator_mode == "☁️ Saved Operators":
+        saved_operators = operator_storage.get_all_operators()
         
-        if operators:
-            st.divider()
-            st.subheader("👤 Step 2: Select & Edit Operator")
-            
+        if saved_operators:
             # Create display names for dropdown
-            def format_operator_name(op):
-                name = op['operator_name']
-                business = op['vending_business_name']
+            def format_saved_operator(op):
+                name = op.get('operator_name', 'Unknown')
+                business = op.get('vending_business_name', '')
                 if business and business != 'N/A':
                     return f"{name} ({business})"
                 return name
             
-            operator_names = [format_operator_name(op) for op in operators]
+            operator_names = [format_saved_operator(op) for op in saved_operators]
             
             selected_idx = st.selectbox(
-                "Select Operator",
-                options=range(len(operators)),
-                index=len(operators) - 1,  # Default to last column
+                "Select Saved Operator",
+                options=range(len(saved_operators)),
+                index=len(saved_operators) - 1,  # Default to most recent
                 format_func=lambda x: operator_names[x],
-                help="Choose which operator's information to use"
+                help="Choose from your saved operators"
             )
             
-            selected_op = operators[selected_idx]
+            selected_saved = saved_operators[selected_idx]
             
-            st.caption("📝 Edit operator details below if needed:")
+            st.caption("📝 Edit operator details if needed:")
             
-            # Editable fields in two columns
-            # Include selected_idx in keys so fields reset when operator changes
             col1, col2 = st.columns(2)
             
             with col1:
-                edited_business_name = st.text_input(
+                saved_business_name = st.text_input(
                     "Vending Business Name",
-                    value=selected_op['vending_business_name'],
-                    key=f"edit_business_name_{selected_idx}"
+                    value=selected_saved.get('vending_business_name', 'N/A'),
+                    key=f"saved_business_{selected_idx}"
                 )
-                edited_operator_name = st.text_input(
+                saved_operator_name = st.text_input(
                     "Operator Name",
-                    value=selected_op['operator_name'],
-                    key=f"edit_operator_name_{selected_idx}"
+                    value=selected_saved.get('operator_name', ''),
+                    key=f"saved_name_{selected_idx}"
                 )
-                edited_phone = st.text_input(
+                saved_phone = st.text_input(
                     "Operator Phone",
-                    value=selected_op['operator_phone'],
-                    key=f"edit_phone_{selected_idx}"
+                    value=selected_saved.get('operator_phone', 'N/A'),
+                    key=f"saved_phone_{selected_idx}"
                 )
-                edited_team = st.text_input(
+                saved_team = st.text_input(
                     "Team",
-                    value=selected_op.get('team', ''),
-                    key=f"edit_team_{selected_idx}"
+                    value=selected_saved.get('team', 'N/A'),
+                    key=f"saved_team_{selected_idx}"
                 )
             
             with col2:
-                edited_email = st.text_input(
+                saved_email = st.text_input(
                     "Operator Email",
-                    value=selected_op['operator_email'],
-                    key=f"edit_email_{selected_idx}"
+                    value=selected_saved.get('operator_email', 'N/A'),
+                    key=f"saved_email_{selected_idx}"
                 )
-                edited_zip = st.text_input(
+                saved_zip = st.text_input(
                     "Operator ZIP Code",
-                    value=selected_op['operator_zip'],
-                    key=f"edit_zip_{selected_idx}"
+                    value=selected_saved.get('operator_zip', 'N/A'),
+                    key=f"saved_zip_{selected_idx}"
                 )
-                edited_website = st.text_input(
+                saved_website = st.text_input(
                     "Operator Website",
-                    value=selected_op['operator_website'],
-                    key=f"edit_website_{selected_idx}"
+                    value=selected_saved.get('operator_website', 'N/A'),
+                    key=f"saved_website_{selected_idx}"
                 )
             
-            # Build operator_info from edited values
             operator_info = {
-                'vending_business_name': edited_business_name,
-                'operator_name': edited_operator_name,
-                'operator_phone': edited_phone,
-                'operator_email': edited_email,
-                'operator_zip': edited_zip,
-                'operator_website': edited_website,
-                'team': edited_team
+                'vending_business_name': saved_business_name,
+                'operator_name': saved_operator_name,
+                'operator_phone': saved_phone,
+                'operator_email': saved_email,
+                'operator_zip': saved_zip,
+                'operator_website': saved_website,
+                'team': saved_team
             }
+            
+            # Management buttons
+            st.divider()
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if st.button("💾 Update Saved", use_container_width=True, help="Save changes to this operator"):
+                    if operator_storage.save_operator(operator_info):
+                        st.success("✅ Operator updated!")
+                        st.rerun()
+            
+            with col2:
+                if st.button("🗑️ Delete", use_container_width=True, type="secondary", help="Remove this operator"):
+                    if operator_storage.delete_operator(selected_saved.get('operator_name')):
+                        st.success("✅ Operator deleted!")
+                        st.rerun()
+            
+            with col3:
+                # Download as JSON backup
+                operator_json = json.dumps(operator_info, indent=2)
+                st.download_button(
+                    label="📥 Export JSON",
+                    data=operator_json,
+                    file_name=f"{saved_operator_name.replace(' ', '_')}_operator.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
         else:
-            st.warning("⚠️ No valid operator data found in the last 5 columns of the Master Data file.")
+            st.info("📭 No saved operators yet. Use 'Manual Entry' to create one and save it to the cloud.")
+    
+    # ---------------------------------------------------------------------
+    # MODE 1: Upload Master Excel File
+    # ---------------------------------------------------------------------
+    if operator_mode == "Upload Master Excel File":
+        master_file = st.file_uploader(
+            "Master Data (Excel)",
+            type=['xlsx', 'xls'],
+            help="Upload the Master Data Excel file with operator info"
+        )
+        
+        if master_file is not None:
+            # Load operators from last 5 columns
+            operators = load_master_data_multi(master_file, num_columns=5)
+            st.session_state.operators_loaded = operators
+            
+            if operators:
+                # Create display names for dropdown
+                def format_operator_name(op):
+                    name = op['operator_name']
+                    business = op['vending_business_name']
+                    if business and business != 'N/A':
+                        return f"{name} ({business})"
+                    return name
+                
+                operator_names = [format_operator_name(op) for op in operators]
+                
+                selected_idx = st.selectbox(
+                    "Select Operator",
+                    options=range(len(operators)),
+                    index=len(operators) - 1,  # Default to last column
+                    format_func=lambda x: operator_names[x],
+                    help="Choose which operator's information to use"
+                )
+                
+                selected_op = operators[selected_idx]
+                
+                st.caption("📝 Edit operator details below if needed:")
+                
+                # Editable fields in two columns
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    edited_business_name = st.text_input(
+                        "Vending Business Name",
+                        value=selected_op['vending_business_name'],
+                        key=f"excel_business_name_{selected_idx}"
+                    )
+                    edited_operator_name = st.text_input(
+                        "Operator Name",
+                        value=selected_op['operator_name'],
+                        key=f"excel_operator_name_{selected_idx}"
+                    )
+                    edited_phone = st.text_input(
+                        "Operator Phone",
+                        value=selected_op['operator_phone'],
+                        key=f"excel_phone_{selected_idx}"
+                    )
+                    edited_team = st.text_input(
+                        "Team",
+                        value=selected_op.get('team', 'N/A'),
+                        key=f"excel_team_{selected_idx}"
+                    )
+                
+                with col2:
+                    edited_email = st.text_input(
+                        "Operator Email",
+                        value=selected_op['operator_email'],
+                        key=f"excel_email_{selected_idx}"
+                    )
+                    edited_zip = st.text_input(
+                        "Operator ZIP Code",
+                        value=selected_op['operator_zip'],
+                        key=f"excel_zip_{selected_idx}"
+                    )
+                    edited_website = st.text_input(
+                        "Operator Website",
+                        value=selected_op['operator_website'],
+                        key=f"excel_website_{selected_idx}"
+                    )
+                
+                # Build operator_info from edited values
+                operator_info = {
+                    'vending_business_name': edited_business_name,
+                    'operator_name': edited_operator_name,
+                    'operator_phone': edited_phone,
+                    'operator_email': edited_email,
+                    'operator_zip': edited_zip,
+                    'operator_website': edited_website,
+                    'team': edited_team
+                }
+                
+                # Option to save this operator for later
+                with st.expander("💾 Save this operator for future use", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    # Cloud save (if configured)
+                    with col1:
+                        if operator_storage.is_configured:
+                            if st.button("☁️ Save to Cloud", use_container_width=True, key="excel_cloud_save"):
+                                if operator_storage.save_operator(operator_info):
+                                    st.success("✅ Saved to cloud!")
+                        else:
+                            st.caption("☁️ Cloud storage not configured")
+                    
+                    # JSON download
+                    with col2:
+                        operator_json = json.dumps(operator_info, indent=2)
+                        safe_name = edited_operator_name.replace(' ', '_').replace('&', 'and')
+                        save_filename = f"{safe_name}_operator.json"
+                        
+                        st.download_button(
+                            label="📥 Download JSON",
+                            data=operator_json,
+                            file_name=save_filename,
+                            mime="application/json",
+                            use_container_width=True
+                        )
+            else:
+                st.warning("⚠️ No valid operator data found in the last 5 columns of the Master Data file.")
+    
+    # ---------------------------------------------------------------------
+    # MODE 2: Manual Entry
+    # ---------------------------------------------------------------------
+    elif operator_mode == "Manual Entry":
+        st.caption("📝 Enter operator details manually:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            manual_business_name = st.text_input(
+                "Vending Business Name",
+                value="",
+                key="manual_business_name",
+                placeholder="e.g., ABC Vending LLC"
+            )
+            manual_operator_name = st.text_input(
+                "Operator Name",
+                value="",
+                key="manual_operator_name",
+                placeholder="e.g., John Smith"
+            )
+            manual_phone = st.text_input(
+                "Operator Phone",
+                value="",
+                key="manual_phone",
+                placeholder="e.g., 555-123-4567"
+            )
+            manual_team = st.text_input(
+                "Team",
+                value="",
+                key="manual_team",
+                placeholder="e.g., John Smith (TX)"
+            )
+        
+        with col2:
+            manual_email = st.text_input(
+                "Operator Email",
+                value="",
+                key="manual_email",
+                placeholder="e.g., john@abcvending.com"
+            )
+            manual_zip = st.text_input(
+                "Operator ZIP Code",
+                value="",
+                key="manual_zip",
+                placeholder="e.g., 75001"
+            )
+            manual_website = st.text_input(
+                "Operator Website",
+                value="",
+                key="manual_website",
+                placeholder="e.g., abcvending.com"
+            )
+        
+        # Validate required field (operator name)
+        if manual_operator_name.strip():
+            operator_info = {
+                'vending_business_name': manual_business_name.strip() or 'N/A',
+                'operator_name': manual_operator_name.strip(),
+                'operator_phone': manual_phone.strip() or 'N/A',
+                'operator_email': manual_email.strip() or 'N/A',
+                'operator_zip': manual_zip.strip() or 'N/A',
+                'operator_website': manual_website.strip() or 'N/A',
+                'team': manual_team.strip() or 'N/A'
+            }
+            
+            # Option to save this operator for later
+            with st.expander("💾 Save this operator for future use", expanded=False):
+                col1, col2 = st.columns(2)
+                
+                # Cloud save (if configured)
+                with col1:
+                    if operator_storage.is_configured:
+                        if st.button("☁️ Save to Cloud", use_container_width=True, key="manual_cloud_save"):
+                            if operator_storage.save_operator(operator_info):
+                                st.success("✅ Saved to cloud!")
+                    else:
+                        st.caption("☁️ Cloud storage not configured")
+                
+                # JSON download
+                with col2:
+                    operator_json = json.dumps(operator_info, indent=2)
+                    safe_name = manual_operator_name.strip().replace(' ', '_').replace('&', 'and')
+                    save_filename = f"{safe_name}_operator.json"
+                    
+                    st.download_button(
+                        label="📥 Download JSON",
+                        data=operator_json,
+                        file_name=save_filename,
+                        mime="application/json",
+                        use_container_width=True
+                    )
+        else:
+            st.info("👆 Please enter at least the Operator Name to continue.")
+    
+    # ---------------------------------------------------------------------
+    # MODE 3: Load from File
+    # ---------------------------------------------------------------------
+    elif operator_mode == "Load from File":
+        st.caption("📂 Load a previously saved operator JSON file:")
+        
+        saved_operator_file = st.file_uploader(
+            "Operator JSON File",
+            type=['json'],
+            help="Upload a previously saved operator JSON file"
+        )
+        
+        if saved_operator_file is not None:
+            try:
+                loaded_operator = json.load(saved_operator_file)
+                
+                st.success(f"✅ Loaded operator: **{loaded_operator.get('operator_name', 'Unknown')}**")
+                
+                st.caption("📝 Edit operator details if needed:")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    loaded_business_name = st.text_input(
+                        "Vending Business Name",
+                        value=loaded_operator.get('vending_business_name', 'N/A'),
+                        key="loaded_business_name"
+                    )
+                    loaded_operator_name = st.text_input(
+                        "Operator Name",
+                        value=loaded_operator.get('operator_name', ''),
+                        key="loaded_operator_name"
+                    )
+                    loaded_phone = st.text_input(
+                        "Operator Phone",
+                        value=loaded_operator.get('operator_phone', 'N/A'),
+                        key="loaded_phone"
+                    )
+                    loaded_team = st.text_input(
+                        "Team",
+                        value=loaded_operator.get('team', 'N/A'),
+                        key="loaded_team"
+                    )
+                
+                with col2:
+                    loaded_email = st.text_input(
+                        "Operator Email",
+                        value=loaded_operator.get('operator_email', 'N/A'),
+                        key="loaded_email"
+                    )
+                    loaded_zip = st.text_input(
+                        "Operator ZIP Code",
+                        value=loaded_operator.get('operator_zip', 'N/A'),
+                        key="loaded_zip"
+                    )
+                    loaded_website = st.text_input(
+                        "Operator Website",
+                        value=loaded_operator.get('operator_website', 'N/A'),
+                        key="loaded_website"
+                    )
+                
+                operator_info = {
+                    'vending_business_name': loaded_business_name,
+                    'operator_name': loaded_operator_name,
+                    'operator_phone': loaded_phone,
+                    'operator_email': loaded_email,
+                    'operator_zip': loaded_zip,
+                    'operator_website': loaded_website,
+                    'team': loaded_team
+                }
+                
+                # Option to save edited operator
+                with st.expander("💾 Save edited operator", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    # Cloud save (if configured)
+                    with col1:
+                        if operator_storage.is_configured:
+                            if st.button("☁️ Save to Cloud", use_container_width=True, key="loaded_cloud_save"):
+                                if operator_storage.save_operator(operator_info):
+                                    st.success("✅ Saved to cloud!")
+                        else:
+                            st.caption("☁️ Cloud storage not configured")
+                    
+                    # JSON download
+                    with col2:
+                        operator_json = json.dumps(operator_info, indent=2)
+                        safe_name = loaded_operator_name.replace(' ', '_').replace('&', 'and')
+                        save_filename = f"{safe_name}_operator.json"
+                        
+                        st.download_button(
+                            label="📥 Download JSON",
+                            data=operator_json,
+                            file_name=save_filename,
+                            mime="application/json",
+                            use_container_width=True
+                        )
+                
+            except json.JSONDecodeError:
+                st.error("❌ Invalid JSON file. Please upload a valid operator file.")
+            except Exception as e:
+                st.error(f"❌ Error loading file: {str(e)}")
     
     st.divider()
     
@@ -874,21 +1432,25 @@ def main():
     
     all_inputs_valid = (
         raw_file is not None and 
-        master_file is not None and
         operator_info is not None and
         data_source is not None
     )
     
     if not all_inputs_valid:
-        st.info("👆 Please upload all required files and select an operator to continue.")
+        st.info("👆 Please upload raw data and provide operator information to continue.")
         
         missing = []
         if raw_file is None:
             missing.append("Raw CSV file")
-        if master_file is None:
-            missing.append("Master Data Excel file")
-        if operator_info is None and master_file is not None:
-            missing.append("Valid operator selection")
+        if operator_info is None:
+            if operator_mode == "☁️ Saved Operators":
+                missing.append("Select a saved operator")
+            elif operator_mode == "Upload Master Excel File":
+                missing.append("Master Data Excel file with valid operator")
+            elif operator_mode == "Manual Entry":
+                missing.append("Operator Name (required)")
+            elif operator_mode == "Load from File":
+                missing.append("Operator JSON file")
         
         if missing:
             st.caption("Missing: " + ", ".join(missing))
