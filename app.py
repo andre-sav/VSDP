@@ -243,9 +243,13 @@ def get_operator_storage():
 # Replace with actual agent emails
 
 CALL_CENTER_AGENTS: List[str] = [
-    "agent1@company.com",
-    "agent2@company.com", 
-    "agent3@company.com",
+  "Courtney@hlmii.com",
+  "Caitlyn@hlmii.com",
+  "Caroline.hlmii.com",
+  "Dodie@hlmii.com",
+  "chelsie@hlmii.com",
+  "Hannah@hlmii.com",
+  "Jessica@hlmii.com",
 ]
 
 
