@@ -245,7 +245,7 @@ def get_operator_storage():
 CALL_CENTER_AGENTS: List[str] = [
   "courtney@hlmii.com",
   "caitlyn@hlmii.com",
-  "caroline.hlmii.com",
+  "caroline@hlmii.com",
   "dodie@hlmii.com",
   "chelsie@hlmii.com",
   "hannah@hlmii.com",
